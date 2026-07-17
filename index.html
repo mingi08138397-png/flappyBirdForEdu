@@ -42,20 +42,86 @@ function playSound(sound) {
   sound.play().catch(() => {});
 }
 
+// 외부 파일 없이도 동작하는 신호위반/준법 통과 효과음 (Web Audio 합성)
+let audioCtx = null;
+function getAudioCtx() {
+  if (!audioCtx) {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    audioCtx = new AC();
+  }
+  if (audioCtx.state === 'suspended') {
+    audioCtx.resume().catch(() => {});
+  }
+  return audioCtx;
+}
+
+function playBeep(freq, duration, type, volume) {
+  try {
+    const ctx = getAudioCtx();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = type;
+    osc.frequency.value = freq;
+    gain.gain.value = volume;
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.start();
+    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + duration / 1000);
+    osc.stop(ctx.currentTime + duration / 1000);
+  } catch (e) {
+    // 오디오를 사용할 수 없는 환경이면 조용히 무시
+  }
+}
+
+function playViolationBeep() {
+  playBeep(180, 260, 'sawtooth', 0.2);
+  setTimeout(() => playBeep(140, 260, 'sawtooth', 0.2), 130);
+}
+
+function playComplySound() {
+  playBeep(880, 110, 'sine', 0.15);
+}
+
+function playUturnSound() {
+  playBeep(520, 90, 'square', 0.18);
+  setTimeout(() => playBeep(760, 140, 'square', 0.18), 90);
+}
+
 const WIDTH = canvas.width;
 const HEIGHT = canvas.height;
 const GROUND_HEIGHT = 64;
 
-const GRAVITY = 0.35;
-const FLAP_VELOCITY = -6.5;
-const MAX_FALL_SPEED = 8;
+const GRAVITY = 0.3;
+const FLAP_VELOCITY = -6.3;
+const MAX_FALL_SPEED = 7.5;
 
 const PIPE_WIDTH = 52;
-const PIPE_GAP = 120;
-const PIPE_SPEED = 2;
-const PIPE_INTERVAL = 90;
+const PIPE_GAP = 150;
+const PIPE_SPEED = 1.7;
+const PIPE_INTERVAL = 105;
 
 const PIXEL = 4;
+
+// ---- 신호등 & 벌점 규칙 설정 ----
+const LIGHT_GREEN = 80;
+const LIGHT_YELLOW = 15;
+const LIGHT_RED = 40;
+const LIGHT_TOTAL = LIGHT_GREEN + LIGHT_YELLOW + LIGHT_RED;
+
+const LIGHT_COLORS = {
+  green: '#3ddc57',
+  yellow: '#ffd23d',
+  red: '#ff3b3b',
+};
+
+const PENALTY_PER_VIOLATION = 10; // 신호위반 1회당 벌점
+const PENALTY_LIMIT = 60;          // 벌점이 다 차면 면허정지(게임오버)
+
+// ---- 유턴 신호 기믹 설정 ----
+const UTURN_SIGN_SIZE = 30;      // 유턴 표지판 크기
+const UTURN_INTERVAL_MIN = 340;  // 유턴 표지판 최소 등장 간격(프레임)
+const UTURN_INTERVAL_MAX = 480;  // 유턴 표지판 최대 등장 간격(프레임)
+const MIN_PIPE_SPACING = PIPE_SPEED * PIPE_INTERVAL; // 파이프 간 최소 간격(정상 스폰 간격과 동일) - 유턴 직후 파이프가 겹치는 것을 방지
 
 const BIRD_FRAMES = [
   [
@@ -94,6 +160,7 @@ const STATE = {
   READY: 'ready',
   PLAY: 'play',
   GAMEOVER: 'gameover',
+  TITLES: 'titles', // 칭호 목록(도감) 화면
 };
 
 let state = STATE.START;
@@ -103,34 +170,273 @@ let wingFrame = 0;
 let wingTimer = 0;
 let idleTimer = 0;
 
+// ---- 신호등/벌점 관련 상태 ----
+let penalty = 0;          // 누적 벌점
+let streak = 0;           // 준법 콤보(연속 초록/노랑 통과)
+let bestStreak = 0;
+let gameOverReason = null; // 'crash' | 'penalty'
+
+// ---- 칭호(등급) 관련 상태 ----
+let currentTitle = null;         // 현재 획득한 칭호 텍스트 (없으면 null)
+let currentTitleColor = '#ffffff';
+
+// 칭호 목록(조건 포함) - 칭호 목록 화면 / 게임오버 화면에서 공통으로 사용
+const TITLE_DEFS = [
+  { text: '위험 운전자', color: '#ff5b5b', desc: `벌점 ${Math.round(PENALTY_LIMIT * 0.7)}점 이상 (주의!)` },
+  { text: '교통 마스터', color: '#ffd23d', desc: '벌점 0점 · 점수 20점 이상' },
+  { text: '모범 시민', color: '#3ddc57', desc: '벌점 0점 · 점수 10점 이상' },
+  { text: '안전 운전자', color: '#7be495', desc: '벌점 0점 · 점수 5점 이상' },
+  { text: '준법 운전자', color: '#5ec8ff', desc: `벌점 1~${Math.round(PENALTY_LIMIT * 0.25)}점 · 점수 5점 이상` },
+];
+
+// 한 번이라도 획득한 적 있는 칭호 목록 (기기에 저장되어 다음 플레이에도 유지됨)
+let achievedTitles = new Set();
+try {
+  const savedTitles = JSON.parse(localStorage.getItem('flappy_achieved_titles') || '[]');
+  achievedTitles = new Set(savedTitles);
+} catch (e) {
+  achievedTitles = new Set();
+}
+
+function markTitleAchieved(text) {
+  if (!text || achievedTitles.has(text)) return;
+  achievedTitles.add(text);
+  try {
+    localStorage.setItem('flappy_achieved_titles', JSON.stringify([...achievedTitles]));
+  } catch (e) {
+    // 저장이 불가능한 환경이면 조용히 무시 (이번 플레이 중에는 정상 동작)
+  }
+}
+
+// ---- 유턴 신호(진행 방향 전환) 관련 상태 ----
+let scrollDir = 1;        // 1 = 정방향(파이프가 왼쪽으로 이동), -1 = 역방향(유턴 후 오른쪽으로 이동)
+let scrollOffset = 0;     // 바닥 무늬 등 배경 스크롤 누적값(방향 반영)
+let uturnSigns = [];      // 화면에 나타나는 유턴 표지판들 {x, y, triggered}
+let uturnTimer = 0;       // 다음 유턴 표지판 등장까지 남은 프레임
+let uturnBannerTimer = 0; // "유턴!" 안내 배너 표시 타이머
+let pipeSpawnTimer = 0;   // 다음 파이프 생성까지 남은 프레임(공간이 없으면 대기)
+
+let flashTimer = 0;
+let flashColor = null;
+
+// ---- 낮/밤 배경 전환 ----
+let bgCycleFrame = 0;                 // 일시정지 여부와 상관없이 계속 흐르는 배경 전용 타이머
+const DAY_NIGHT_CYCLE = 2400;         // 한 주기(낮->밤->낮) 길이 (프레임)
+
+function getNightFactor() {
+  // 0 = 완전한 낮, 1 = 완전한 밤. 코사인 곡선으로 부드럽게 전환됨
+  return (1 - Math.cos((bgCycleFrame / DAY_NIGHT_CYCLE) * Math.PI * 2)) / 2;
+}
+
+function mixRGBA(a, b, t) {
+  const r = Math.round(a.r + (b.r - a.r) * t);
+  const g = Math.round(a.g + (b.g - a.g) * t);
+  const bl = Math.round(a.b + (b.b - a.b) * t);
+  const al = a.a + (b.a - a.a) * t;
+  return `rgba(${r},${g},${bl},${al.toFixed(2)})`;
+}
+
+// 밤하늘에 뜨는 별 (고정된 위치에서 은은하게 반짝임)
+const STARS = [];
+(function initStars() {
+  let s = 13;
+  const skyBottom = HEIGHT - GROUND_HEIGHT - 40;
+  for (let i = 0; i < 45; i++) {
+    s = (s * 31 + 7) % 997;
+    const x = s % WIDTH;
+    s = (s * 17 + 3) % 997;
+    const y = 8 + (s % skyBottom);
+    s = (s * 13 + 11) % 997;
+    const size = 1 + (s % 2);
+    s = (s * 19 + 5) % 997;
+    const phase = s % 100;
+    STARS.push({ x, y, size, phase });
+  }
+})();
+
+const popups = []; // {x, y, text, color, life, maxLife}
+
+function spawnPopup(x, y, text, color) {
+  popups.push({ x, y, text, color, life: 40, maxLife: 40 });
+}
+
+function triggerFlash(color) {
+  flashColor = color;
+  flashTimer = 14;
+}
+
+// 현재 점수/벌점 상태에 맞는 칭호를 반환 (해당 없으면 null)
+// 벌점이 낮을수록, 점수가 높을수록 더 좋은 칭호를 얻음
+function getTitleInfo(currentScore, currentPenalty) {
+  if (currentPenalty >= PENALTY_LIMIT * 0.7) {
+    return { text: '위험 운전자', color: '#ff5b5b' };
+  }
+  if (currentPenalty === 0 && currentScore >= 20) {
+    return { text: '교통 마스터', color: '#ffd23d' };
+  }
+  if (currentPenalty === 0 && currentScore >= 10) {
+    return { text: '모범 시민', color: '#3ddc57' };
+  }
+  if (currentPenalty === 0 && currentScore >= 5) {
+    return { text: '안전 운전자', color: '#7be495' };
+  }
+  if (currentPenalty > 0 && currentPenalty <= PENALTY_LIMIT * 0.25 && currentScore >= 5) {
+    return { text: '준법 운전자', color: '#5ec8ff' };
+  }
+  return null;
+}
+
+// 칭호가 새로 바뀌었는지 확인하고, 바뀌었다면 알림(팝업/효과음)을 띄움
+function updateTitle() {
+  const info = getTitleInfo(score, penalty);
+  const nextText = info ? info.text : null;
+  if (nextText !== currentTitle) {
+    currentTitle = nextText;
+    currentTitleColor = info ? info.color : '#ffffff';
+    if (currentTitle) {
+      spawnPopup(bird.x, bird.y - 46, `칭호 획득: ${currentTitle}!`, currentTitleColor);
+      playComplySound();
+      markTitleAchieved(currentTitle);
+    }
+  }
+}
+
+// ---- 좌우 이동(유턴/전진) 설정 ----
+const BIRD_MIN_X = 30;   // 뒤로 물러날 수 있는 최소 x (유턴 대기)
+const BIRD_MAX_X = 240;  // 앞으로 나갈 수 있는 최대 x
+const BIRD_H_SPEED = 2.6; // 좌우 이동 속도 (파이프 속도 2보다 살짝 빠르게 설정 -> 따라잡기/거리벌리기 가능)
+
 const bird = {
   x: 80,
   y: HEIGHT / 2,
   vy: 0,
+  facingLeft: false,
 };
+
+let moveLeftHeld = false;  // 유턴(뒤로 대기)
+let moveRightHeld = false; // 전진(앞으로)
 
 let pipes = [];
 let gameOverTimer = 0;
 
 function resetGame() {
+  bird.x = 80;
   bird.y = HEIGHT / 2;
   bird.vy = 0;
+  bird.facingLeft = false;
+  moveLeftHeld = false;
+  moveRightHeld = false;
   pipes = [];
   score = 0;
   frameCount = 0;
+  penalty = 0;
+  streak = 0;
+  gameOverReason = null;
+  currentTitle = null;
+  currentTitleColor = '#ffffff';
+  flashTimer = 0;
+  popups.length = 0;
+  paused = false;
+
+  scrollDir = 1;
+  scrollOffset = 0;
+  uturnSigns.length = 0;
+  uturnTimer = UTURN_INTERVAL_MIN + Math.floor(Math.random() * (UTURN_INTERVAL_MAX - UTURN_INTERVAL_MIN));
+  uturnBannerTimer = 0;
+  pipeSpawnTimer = PIPE_INTERVAL;
 }
 
 function spawnPipe() {
   const margin = 40;
   const gapY = margin + Math.random() * (HEIGHT - GROUND_HEIGHT - margin * 2 - PIPE_GAP) + PIPE_GAP / 2;
-  pipes.push({ x: WIDTH, gapY, passed: false });
+  const lightOffset = Math.floor(Math.random() * LIGHT_TOTAL);
+  const spawnX = scrollDir === 1 ? WIDTH : -PIPE_WIDTH;
+  pipes.push({ x: spawnX, gapY, passed: false, violated: false, lightOffset });
+}
+
+// 스폰 지점 근처에 이미 파이프가 있으면 생성을 미뤄서 파이프끼리 겹치지 않도록 함
+// (유턴으로 진행 방향이 바뀐 직후 기존 파이프와 새 파이프가 붙어버리는 문제 방지)
+function trySpawnPipe() {
+  const spawnX = scrollDir === 1 ? WIDTH : -PIPE_WIDTH;
+  for (const pipe of pipes) {
+    if (Math.abs(pipe.x - spawnX) < MIN_PIPE_SPACING) {
+      return false;
+    }
+  }
+  spawnPipe();
+  return true;
+}
+
+// 유턴 표지판 생성: 진행 방향의 "들어오는 쪽"에서 등장해 반대쪽으로 흘러감
+function spawnUturnSign() {
+  const margin = 60;
+  const y = margin + Math.random() * (HEIGHT - GROUND_HEIGHT - margin * 2);
+  const x = scrollDir === 1 ? WIDTH + UTURN_SIGN_SIZE : -UTURN_SIGN_SIZE;
+  uturnSigns.push({ x, y, triggered: false });
+}
+
+// 현재 프레임에서 해당 파이프 신호등의 색상 계산
+function getLightColor(pipe, frame) {
+  const t = (frame + pipe.lightOffset) % LIGHT_TOTAL;
+  if (t < LIGHT_GREEN) return 'green';
+  if (t < LIGHT_GREEN + LIGHT_YELLOW) return 'yellow';
+  return 'red';
 }
 
 function flap() {
   bird.vy = FLAP_VELOCITY;
 }
 
+// ---- 일시정지 기능 ----
+let paused = false;
+const PAUSE_BTN = { x: WIDTH - 36, y: 8, w: 28, h: 28 };
+
+// ---- 좌우 이동 버튼 (하단) ----
+const LEFT_BTN = { x: 10, y: HEIGHT - GROUND_HEIGHT - 46, w: 66, h: 38 };
+const RIGHT_BTN = { x: WIDTH - 76, y: HEIGHT - GROUND_HEIGHT - 46, w: 66, h: 38 };
+
+// ---- 시작화면 버튼 좌표 ----
+const START_PANEL_Y = 82;
+const START_PANEL_H = 144;
+const START_BTN = { x: WIDTH / 2 - 70, y: START_PANEL_Y + START_PANEL_H + 22, w: 140, h: 44 };
+const TITLES_BTN = { x: WIDTH / 2 - 70, y: START_BTN.y + START_BTN.h + 12, w: 140, h: 34 };
+
+function togglePause() {
+  if (state !== STATE.PLAY) return;
+  paused = !paused;
+}
+
+// 마우스/터치 좌표를 캔버스 내부 좌표(320x480 기준)로 변환
+function getCanvasPos(clientX, clientY) {
+  const rect = canvas.getBoundingClientRect();
+  const scaleX = WIDTH / rect.width;
+  const scaleY = HEIGHT / rect.height;
+  return {
+    x: (clientX - rect.left) * scaleX,
+    y: (clientY - rect.top) * scaleY,
+  };
+}
+
+function isInsideRect(pos, rect) {
+  return (
+    pos.x >= rect.x &&
+    pos.x <= rect.x + rect.w &&
+    pos.y >= rect.y &&
+    pos.y <= rect.y + rect.h
+  );
+}
+
+function isInsidePauseButton(pos) {
+  return state === STATE.PLAY && isInsideRect(pos, PAUSE_BTN);
+}
+
+function releaseMoveButtons() {
+  moveLeftHeld = false;
+  moveRightHeld = false;
+}
+
 function handleInput() {
+  getAudioCtx();
   if (state === STATE.START) {
     resetGame();
     state = STATE.READY;
@@ -138,24 +444,100 @@ function handleInput() {
     state = STATE.PLAY;
     flap();
   } else if (state === STATE.PLAY) {
-    flap();
+    if (paused) {
+      paused = false; // 일시정지 중 화면을 탭하면 재개
+    } else {
+      flap();
+    }
   } else if (state === STATE.GAMEOVER) {
     if (gameOverTimer > 15) {
       resetGame();
       state = STATE.START;
     }
+  } else if (state === STATE.TITLES) {
+    state = STATE.START;
   }
 }
 
-canvas.addEventListener('mousedown', handleInput);
+canvas.addEventListener('mousedown', (e) => {
+  const pos = getCanvasPos(e.clientX, e.clientY);
+  if (state === STATE.TITLES) {
+    state = STATE.START;
+    return;
+  }
+  if (state === STATE.START && isInsideRect(pos, TITLES_BTN)) {
+    state = STATE.TITLES;
+    return;
+  }
+  if (isInsidePauseButton(pos)) {
+    togglePause();
+    return;
+  }
+  if (state === STATE.PLAY && !paused && isInsideRect(pos, LEFT_BTN)) {
+    moveLeftHeld = true;
+    return;
+  }
+  if (state === STATE.PLAY && !paused && isInsideRect(pos, RIGHT_BTN)) {
+    moveRightHeld = true;
+    return;
+  }
+  handleInput();
+});
+window.addEventListener('mouseup', releaseMoveButtons);
+canvas.addEventListener('mouseleave', releaseMoveButtons);
+
 canvas.addEventListener('touchstart', (e) => {
   e.preventDefault();
+  const touch = e.changedTouches[0];
+  const pos = getCanvasPos(touch.clientX, touch.clientY);
+  if (state === STATE.TITLES) {
+    state = STATE.START;
+    return;
+  }
+  if (state === STATE.START && isInsideRect(pos, TITLES_BTN)) {
+    state = STATE.TITLES;
+    return;
+  }
+  if (isInsidePauseButton(pos)) {
+    togglePause();
+    return;
+  }
+  if (state === STATE.PLAY && !paused && isInsideRect(pos, LEFT_BTN)) {
+    moveLeftHeld = true;
+    return;
+  }
+  if (state === STATE.PLAY && !paused && isInsideRect(pos, RIGHT_BTN)) {
+    moveRightHeld = true;
+    return;
+  }
   handleInput();
 }, { passive: false });
+canvas.addEventListener('touchend', (e) => {
+  e.preventDefault();
+  releaseMoveButtons();
+}, { passive: false });
+canvas.addEventListener('touchcancel', releaseMoveButtons);
+
 window.addEventListener('keydown', (e) => {
   if (e.code === 'Space') {
     e.preventDefault();
     handleInput();
+  } else if (e.code === 'KeyP' || e.code === 'Escape') {
+    e.preventDefault();
+    togglePause();
+  } else if (e.code === 'ArrowLeft' || e.code === 'KeyA') {
+    e.preventDefault();
+    moveLeftHeld = true;
+  } else if (e.code === 'ArrowRight' || e.code === 'KeyD') {
+    e.preventDefault();
+    moveRightHeld = true;
+  }
+});
+window.addEventListener('keyup', (e) => {
+  if (e.code === 'ArrowLeft' || e.code === 'KeyA') {
+    moveLeftHeld = false;
+  } else if (e.code === 'ArrowRight' || e.code === 'KeyD') {
+    moveRightHeld = false;
   }
 });
 
@@ -169,22 +551,119 @@ function updatePlay() {
   }
 
   frameCount++;
-  if (frameCount % PIPE_INTERVAL === 0) {
-    spawnPipe();
-  }
+  scrollOffset += PIPE_SPEED * scrollDir;
 
-  for (const pipe of pipes) {
-    pipe.x -= PIPE_SPEED;
-    if (!pipe.passed && pipe.x + PIPE_WIDTH < bird.x) {
-      pipe.passed = true;
-      score++;
-      playSound(pointSound);
+  pipeSpawnTimer--;
+  if (pipeSpawnTimer <= 0) {
+    if (trySpawnPipe()) {
+      pipeSpawnTimer = PIPE_INTERVAL;
+    } else {
+      pipeSpawnTimer = 10; // 공간이 부족하면 잠시 후 다시 시도
     }
   }
-  pipes = pipes.filter((p) => p.x + PIPE_WIDTH > 0);
+
+  // 유턴 표지판 등장 타이머
+  uturnTimer--;
+  if (uturnTimer <= 0) {
+    spawnUturnSign();
+    uturnTimer = UTURN_INTERVAL_MIN + Math.floor(Math.random() * (UTURN_INTERVAL_MAX - UTURN_INTERVAL_MIN));
+  }
+  if (uturnBannerTimer > 0) uturnBannerTimer--;
+
+  // 좌우 이동: 왼쪽(유턴)을 누르면 뒤로 물러나 신호가 바뀔 때까지 대기 가능,
+  // 오른쪽(전진)을 누르면 앞으로 나가 파이프에 더 빨리 다가감
+  if (moveLeftHeld && !moveRightHeld) {
+    bird.x -= BIRD_H_SPEED;
+    bird.facingLeft = true;
+  } else if (moveRightHeld && !moveLeftHeld) {
+    bird.x += BIRD_H_SPEED;
+    bird.facingLeft = false;
+  } else {
+    // 버튼을 누르지 않을 때는 현재 진행 방향(정방향/유턴 후 역방향)에 맞춰 새의 방향을 맞춤
+    bird.facingLeft = scrollDir === -1;
+  }
+  bird.x = Math.max(BIRD_MIN_X, Math.min(BIRD_MAX_X, bird.x));
+
+  const birdLeft = bird.x - BIRD_SIZE / 2;
+  const birdRight = bird.x + BIRD_SIZE / 2;
+
+  for (const pipe of pipes) {
+    pipe.x -= PIPE_SPEED * scrollDir;
+
+    // 새가 파이프 구간(gap) 을 지나가는 동안 신호가 빨간불이면 위반으로 기록
+    const withinX = birdRight > pipe.x && birdLeft < pipe.x + PIPE_WIDTH;
+    if (withinX && !pipe.violated) {
+      const color = getLightColor(pipe, frameCount);
+      if (color === 'red') {
+        pipe.violated = true;
+        penalty = Math.min(penalty + PENALTY_PER_VIOLATION, PENALTY_LIMIT);
+        streak = 0;
+        triggerFlash('red');
+        spawnPopup(bird.x, bird.y - 30, `신호위반 +${PENALTY_PER_VIOLATION}`, '#ff3b3b');
+        playViolationBeep();
+      }
+    }
+
+    // 진행 방향에 따라 "통과" 판정 기준이 달라짐 (정방향: 파이프가 왼쪽으로 빠짐 / 역방향: 오른쪽으로 빠짐)
+    const passedThisPipe = scrollDir === 1
+      ? pipe.x + PIPE_WIDTH < birdLeft
+      : pipe.x > birdRight;
+
+    if (!pipe.passed && passedThisPipe) {
+      pipe.passed = true;
+      if (pipe.violated) {
+        // 위반 파이프는 점수를 주지 않음 (벌점만 부과됨)
+      } else {
+        score++;
+        streak++;
+        bestStreak = Math.max(bestStreak, streak);
+        triggerFlash('green');
+        spawnPopup(bird.x, bird.y - 30, '준법 +1', '#3ddc57');
+        playSound(pointSound);
+        playComplySound();
+      }
+    }
+  }
+  pipes = pipes.filter((p) => p.x + PIPE_WIDTH > -80 && p.x < WIDTH + 80);
+
+  // 유턴 표지판 이동 및 통과 판정: 새가 표지판을 지나면 진행 방향이 반전됨
+  for (const sign of uturnSigns) {
+    sign.x -= PIPE_SPEED * scrollDir;
+    const signLeft = sign.x - UTURN_SIGN_SIZE / 2;
+    const signRight = sign.x + UTURN_SIGN_SIZE / 2;
+    const overlap = birdRight > signLeft && birdLeft < signRight;
+    if (overlap && !sign.triggered) {
+      sign.triggered = true;
+      scrollDir *= -1;
+      triggerFlash('uturn');
+      uturnBannerTimer = 50;
+      spawnPopup(bird.x, bird.y - 30, '유턴!', '#3dc9ff');
+      playUturnSound();
+      // 방향이 바뀐 직후 곧바로 파이프가 스폰되어 기존 파이프와 겹치지 않도록 대기시간 확보
+      pipeSpawnTimer = Math.max(pipeSpawnTimer, PIPE_INTERVAL);
+    }
+  }
+  uturnSigns = uturnSigns.filter((s) => s.x > -80 && s.x < WIDTH + 80);
+
+  for (const p of popups) {
+    p.y -= 0.6;
+    p.life--;
+  }
+  for (let i = popups.length - 1; i >= 0; i--) {
+    if (popups[i].life <= 0) popups.splice(i, 1);
+  }
+  if (flashTimer > 0) flashTimer--;
+
+  updateTitle();
 
   if (checkCollision()) {
     state = STATE.GAMEOVER;
+    gameOverReason = 'crash';
+    gameOverTimer = 0;
+    playSound(dieSound);
+  } else if (penalty >= PENALTY_LIMIT) {
+    state = STATE.GAMEOVER;
+    gameOverReason = 'penalty';
     gameOverTimer = 0;
     playSound(dieSound);
   }
@@ -219,16 +698,39 @@ function updateWingAnimation() {
   }
 }
 
+const SKY_DAY = { r: 78, g: 192, b: 202 };
+const SKY_NIGHT = { r: 12, g: 17, b: 46 };
+const BUILDING_DAY = { r: 255, g: 255, b: 255, a: 0.35 };
+const BUILDING_NIGHT = { r: 14, g: 18, b: 40, a: 0.85 };
+
 function drawBackground() {
-  ctx.fillStyle = '#4ec0ca';
+  const nightFactor = getNightFactor();
+
+  // 하늘: 낮의 하늘색에서 밤의 짙은 남색으로 부드럽게 전환
+  const sky = mixRGBA({ ...SKY_DAY, a: 1 }, { ...SKY_NIGHT, a: 1 }, nightFactor);
+  ctx.fillStyle = sky;
   ctx.fillRect(0, 0, WIDTH, HEIGHT - GROUND_HEIGHT);
 
-  ctx.fillStyle = 'rgba(255,255,255,0.5)';
+  // 별: 밤이 깊어질수록 서서히 나타나며 각자 다른 리듬으로 반짝임
+  if (nightFactor > 0.02) {
+    ctx.save();
+    for (const star of STARS) {
+      const twinkle = 0.5 + 0.5 * Math.sin((bgCycleFrame + star.phase * 4) / 25);
+      ctx.globalAlpha = nightFactor * (0.4 + 0.6 * twinkle);
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(star.x, star.y, star.size, star.size);
+    }
+    ctx.restore();
+  }
+
+  // 구름: 낮에는 또렷하게, 밤에는 옅게(달빛에 비친 구름 느낌)
+  ctx.fillStyle = `rgba(255,255,255,${(0.5 * (1 - nightFactor * 0.75)).toFixed(2)})`;
   drawCloud(40, 80);
   drawCloud(200, 50);
   drawCloud(260, 130);
 
-  ctx.fillStyle = 'rgba(255,255,255,0.35)';
+  // 건물: 낮에는 밝은 반투명 실루엣, 밤에는 짙은 실루엣 + 창문 불빛
+  ctx.fillStyle = mixRGBA(BUILDING_DAY, BUILDING_NIGHT, nightFactor);
   const buildingBaseY = HEIGHT - GROUND_HEIGHT;
   let bx = 0;
   let seed = 7;
@@ -237,8 +739,30 @@ function drawBackground() {
     const bw = 24 + (seed % 20);
     const bh = 30 + (seed % 60);
     ctx.fillRect(bx, buildingBaseY - bh, bw, bh);
+    drawBuildingWindows(bx, buildingBaseY, bw, bh, seed, nightFactor);
     bx += bw + 6;
   }
+}
+
+// 건물 안에서 빛나는 창문 (밤에만 서서히 나타남)
+function drawBuildingWindows(bx, buildingBaseY, bw, bh, seed, nightFactor) {
+  if (nightFactor <= 0.05) return;
+  const winW = 3, winH = 4, gapX = 6, gapY = 8, margin = 4;
+  const cols = Math.floor((bw - margin * 2) / gapX);
+  const rows = Math.floor((bh - margin * 2) / gapY);
+  ctx.save();
+  ctx.fillStyle = '#ffd97a';
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      const lit = (seed + r * 13 + c * 7) % 5 === 0 || (seed + r * 7 + c * 11) % 7 === 0;
+      if (!lit) continue;
+      const wx = bx + margin + c * gapX;
+      const wy = buildingBaseY - bh + margin + r * gapY;
+      ctx.globalAlpha = nightFactor * 0.9;
+      ctx.fillRect(wx, wy, winW, winH);
+    }
+  }
+  ctx.restore();
 }
 
 function drawCloud(cx, cy) {
@@ -259,12 +783,19 @@ function drawGround() {
   ctx.fillRect(0, groundY, WIDTH, stripeH);
   ctx.fillStyle = '#4f8a4f';
   const stripeW = 16;
-  const offset = (frameCount * PIPE_SPEED) % (stripeW * 2);
+  const offset = ((scrollOffset % (stripeW * 2)) + stripeW * 2) % (stripeW * 2);
   for (let x = -stripeW * 2 + offset; x < WIDTH; x += stripeW * 2) {
     ctx.fillRect(x, groundY, stripeW, stripeH);
   }
   ctx.fillStyle = '#3d6e3f';
   ctx.fillRect(0, groundY, WIDTH, 3);
+
+  // 밤에는 땅도 하늘과 어울리도록 살짝 어둡게
+  const nightFactor = getNightFactor();
+  if (nightFactor > 0.02) {
+    ctx.fillStyle = `rgba(5,8,25,${(nightFactor * 0.35).toFixed(2)})`;
+    ctx.fillRect(0, groundY, WIDTH, GROUND_HEIGHT);
+  }
 }
 
 function drawPipe(pipe) {
@@ -289,22 +820,124 @@ function drawPipe(pipe) {
   ctx.strokeRect(pipe.x - capOverhang, gapBottom, PIPE_WIDTH + capOverhang * 2, capHeight);
 }
 
+function drawTrafficLight(pipe) {
+  const color = getLightColor(pipe, frameCount);
+  const boxW = 16;
+  const boxH = 38;
+  const cx = pipe.x + PIPE_WIDTH / 2;
+  const cy = pipe.gapY;
+  const boxX = cx - boxW / 2;
+  const boxY = cy - boxH / 2;
+
+  ctx.fillStyle = '#1c1c1c';
+  ctx.strokeStyle = '#000000';
+  ctx.lineWidth = 2;
+  ctx.fillRect(boxX, boxY, boxW, boxH);
+  ctx.strokeRect(boxX, boxY, boxW, boxH);
+
+  const order = ['red', 'yellow', 'green'];
+  const radius = 4.5;
+  order.forEach((c, i) => {
+    const lampY = boxY + boxH * (0.22 + i * 0.28);
+    ctx.beginPath();
+    ctx.arc(cx, lampY, radius, 0, Math.PI * 2);
+    if (c === color) {
+      ctx.fillStyle = LIGHT_COLORS[c];
+      ctx.shadowColor = LIGHT_COLORS[c];
+      ctx.shadowBlur = 8;
+    } else {
+      ctx.fillStyle = '#3a3a3a';
+      ctx.shadowBlur = 0;
+    }
+    ctx.fill();
+    ctx.shadowBlur = 0;
+  });
+}
+
+function drawUturnSigns() {
+  for (const sign of uturnSigns) {
+    ctx.save();
+    ctx.translate(sign.x, sign.y);
+
+    // 파란 원형 유턴 표지판
+    ctx.beginPath();
+    ctx.arc(0, 0, UTURN_SIGN_SIZE / 2, 0, Math.PI * 2);
+    ctx.fillStyle = '#1a63d1';
+    ctx.shadowColor = 'rgba(61,201,255,0.8)';
+    ctx.shadowBlur = 6;
+    ctx.fill();
+    ctx.shadowBlur = 0;
+    ctx.strokeStyle = '#ffffff';
+    ctx.lineWidth = 3;
+    ctx.stroke();
+
+    // 흰색 U자 유턴 화살표
+    ctx.strokeStyle = '#ffffff';
+    ctx.fillStyle = '#ffffff';
+    ctx.lineWidth = 3.5;
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.arc(0, 2, 6, Math.PI * 0.05, Math.PI * 0.95, false);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(-6, 2);
+    ctx.lineTo(-6, -7);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(-6, -9);
+    ctx.lineTo(-10, -2.5);
+    ctx.lineTo(-2, -2.5);
+    ctx.closePath();
+    ctx.fill();
+    ctx.beginPath();
+    ctx.moveTo(6, 2);
+    ctx.lineTo(6, 8);
+    ctx.stroke();
+
+    ctx.restore();
+
+    drawOutlinedText('유턴', sign.x, sign.y + UTURN_SIGN_SIZE / 2 + 12, 10, '#3dc9ff');
+  }
+}
+
+function drawUturnBanner() {
+  const alpha = Math.min(uturnBannerTimer / 20, 1);
+  ctx.globalAlpha = alpha;
+  ctx.fillStyle = 'rgba(10,40,90,0.55)';
+  ctx.fillRect(0, HEIGHT / 2 - 34, WIDTH, 60);
+  drawOutlinedText('유턴! 진행 방향 전환', WIDTH / 2, HEIGHT / 2 - 8, 18, '#3dc9ff');
+  const dirLabel = scrollDir === 1 ? '▶ 정방향 진행 중' : '◀ 역방향 진행 중';
+  ctx.font = 'bold 12px monospace';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.lineWidth = 3;
+  ctx.strokeStyle = '#000000';
+  ctx.strokeText(dirLabel, WIDTH / 2, HEIGHT / 2 + 16);
+  ctx.fillStyle = '#ffffff';
+  ctx.fillText(dirLabel, WIDTH / 2, HEIGHT / 2 + 16);
+  ctx.globalAlpha = 1;
+}
+
 function drawPipes() {
   for (const pipe of pipes) {
     drawPipe(pipe);
+    drawTrafficLight(pipe);
   }
 }
 
 function drawBird() {
   const sprite = BIRD_FRAMES[wingFrame];
-  const originX = bird.x - BIRD_SIZE / 2;
-  const originY = bird.y - BIRD_SIZE / 2;
 
   const angle = Math.max(-0.4, Math.min(0.9, bird.vy / 10));
   ctx.save();
   ctx.translate(bird.x, bird.y);
   ctx.rotate(angle);
-  ctx.translate(-bird.x, -bird.y);
+  if (bird.facingLeft) {
+    ctx.scale(-1, 1);
+  }
+
+  const originX = -BIRD_SIZE / 2;
+  const originY = -BIRD_SIZE / 2;
 
   for (let row = 0; row < sprite.length; row++) {
     for (let col = 0; col < sprite[row].length; col++) {
@@ -341,9 +974,229 @@ function drawScore() {
   drawOutlinedText(String(score), WIDTH / 2, 50, 32, '#ffffff');
 }
 
+function drawTitleBadge() {
+  if (!currentTitle) return;
+  const label = `★ ${currentTitle} ★`;
+  const centerY = 74;
+
+  ctx.font = 'bold 14px monospace';
+  const textWidth = ctx.measureText(label).width;
+  const padX = 12;
+  const badgeW = textWidth + padX * 2;
+  const badgeH = 24;
+  const badgeX = WIDTH / 2 - badgeW / 2;
+  const badgeY = centerY - badgeH / 2;
+
+  // 반투명 배경 패널 + 칭호 색상 테두리로 눈에 띄게 표시
+  ctx.fillStyle = 'rgba(0,0,0,0.55)';
+  ctx.fillRect(badgeX, badgeY, badgeW, badgeH);
+  ctx.strokeStyle = currentTitleColor;
+  ctx.lineWidth = 2;
+  ctx.strokeRect(badgeX, badgeY, badgeW, badgeH);
+
+  // 은은한 글로우 효과
+  ctx.shadowColor = currentTitleColor;
+  ctx.shadowBlur = 9;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.lineWidth = 3;
+  ctx.strokeStyle = '#000000';
+  ctx.strokeText(label, WIDTH / 2, centerY);
+  ctx.fillStyle = currentTitleColor;
+  ctx.fillText(label, WIDTH / 2, centerY);
+  ctx.shadowBlur = 0;
+}
+
+function drawPenaltyHUD() {
+  // 좌측 상단: 벌점 게이지
+  const barX = 10;
+  const barY = 10;
+  const barW = 110;
+  const barH = 14;
+
+  ctx.font = 'bold 11px monospace';
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'top';
+  ctx.fillStyle = '#ffffff';
+  ctx.strokeStyle = '#000000';
+  ctx.lineWidth = 3;
+  ctx.strokeText('벌점', barX, barY - 12);
+  ctx.fillText('벌점', barX, barY - 12);
+
+  ctx.fillStyle = 'rgba(0,0,0,0.5)';
+  ctx.fillRect(barX, barY, barW, barH);
+  const ratio = Math.min(penalty / PENALTY_LIMIT, 1);
+  ctx.fillStyle = ratio > 0.7 ? '#ff3b3b' : ratio > 0.4 ? '#ffd23d' : '#3ddc57';
+  ctx.fillRect(barX, barY, barW * ratio, barH);
+  ctx.strokeStyle = '#ffffff';
+  ctx.lineWidth = 1.5;
+  ctx.strokeRect(barX, barY, barW, barH);
+
+  ctx.font = 'bold 10px monospace';
+  ctx.fillStyle = '#ffffff';
+  ctx.textAlign = 'center';
+  ctx.fillText(`${penalty} / ${PENALTY_LIMIT}`, barX + barW / 2, barY + 2);
+
+  // 중앙 상단: 준법 콤보 (벌점 게이지와 일시정지 버튼 사이 - 서로 겹치지 않도록 배치)
+  const comboText = `콤보 x${streak}`;
+  const comboCenterX = (barX + barW + PAUSE_BTN.x) / 2;
+  ctx.font = 'bold 12px monospace';
+  const comboTextWidth = ctx.measureText(comboText).width;
+  const badgePadX = 8;
+  const badgeW = comboTextWidth + badgePadX * 2;
+  const badgeH = 20;
+  const badgeX = comboCenterX - badgeW / 2;
+  const badgeY = barY - 3;
+
+  ctx.fillStyle = 'rgba(0,0,0,0.45)';
+  ctx.fillRect(badgeX, badgeY, badgeW, badgeH);
+  ctx.strokeStyle = 'rgba(255,255,255,0.45)';
+  ctx.lineWidth = 1.5;
+  ctx.strokeRect(badgeX, badgeY, badgeW, badgeH);
+
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.lineWidth = 3;
+  ctx.strokeStyle = '#000000';
+  ctx.strokeText(comboText, comboCenterX, badgeY + badgeH / 2);
+  ctx.fillStyle = '#3ddc57';
+  ctx.fillText(comboText, comboCenterX, badgeY + badgeH / 2);
+}
+
+function drawPopups() {
+  for (const p of popups) {
+    const alpha = Math.max(p.life / p.maxLife, 0);
+    ctx.globalAlpha = alpha;
+    ctx.font = 'bold 13px monospace';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.lineWidth = 3;
+    ctx.strokeStyle = '#000000';
+    ctx.strokeText(p.text, p.x, p.y);
+    ctx.fillStyle = p.color;
+    ctx.fillText(p.text, p.x, p.y);
+    ctx.globalAlpha = 1;
+  }
+}
+
+function drawFlashOverlay() {
+  if (flashTimer <= 0 || !flashColor) return;
+  const alpha = (flashTimer / 14) * 0.35;
+  let color;
+  if (flashColor === 'red') color = `rgba(255,0,0,${alpha})`;
+  else if (flashColor === 'uturn') color = `rgba(61,201,255,${alpha})`;
+  else color = `rgba(60,220,90,${alpha})`;
+  ctx.fillStyle = color;
+  ctx.fillRect(0, 0, WIDTH, HEIGHT);
+}
+
 function drawStartScreen() {
-  drawOutlinedText('Flappy Bird', WIDTH / 2, 140, 28, '#fbd93a');
-  drawButton(WIDTH / 2 - 70, 260, 140, 44, 'START');
+  drawOutlinedText('Flappy Bird', WIDTH / 2, 46, 24, '#fbd93a');
+  drawOutlinedText('신호등 & 유턴 미션', WIDTH / 2, 68, 12, '#ffe9a8');
+
+  // 설명을 읽기 쉽게 반투명 패널 배경을 깔아줌
+  const panelX = 16;
+  const panelY = START_PANEL_Y;
+  const panelW = WIDTH - 32;
+  const panelH = START_PANEL_H;
+  ctx.fillStyle = 'rgba(0,0,0,0.42)';
+  ctx.fillRect(panelX, panelY, panelW, panelH);
+  ctx.strokeStyle = 'rgba(255,255,255,0.5)';
+  ctx.lineWidth = 1.5;
+  ctx.strokeRect(panelX, panelY, panelW, panelH);
+
+  ctx.font = 'bold 10px monospace';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.lineWidth = 3;
+  ctx.strokeStyle = '#000000';
+
+  // 규칙을 하나씩, 관련된 색으로 구분해서 보여줌 (초록=안전, 빨강=위반, 파랑=유턴, 금색=칭호)
+  const rules = [
+    { text: '탭하면 새가 위로 날아올라요', color: '#ffffff' },
+    { text: '초록불·노란불에 통과하면 +1점', color: '#3ddc57' },
+    { text: '빨간불에 통과하면 벌점을 받아요', color: '#ff6b6b' },
+    { text: `벌점이 ${PENALTY_LIMIT}점 넘으면 면허정지!`, color: '#ffffff' },
+    { text: '◀유턴 버튼: 제자리에서 대기', color: '#ffffff' },
+    { text: '▶전진 버튼: 앞으로 이동', color: '#ffffff' },
+    { text: '파란 유턴 표지판: 방향이 반대로!', color: '#5ec8ff' },
+    { text: '벌점 없이 점수를 올리면 칭호 획득!', color: '#ffd23d' },
+  ];
+  rules.forEach((rule, i) => {
+    const y = panelY + 16 + i * 16;
+    ctx.strokeText(rule.text, WIDTH / 2, y);
+    ctx.fillStyle = rule.color;
+    ctx.fillText(rule.text, WIDTH / 2, y);
+  });
+
+  drawButton(START_BTN.x, START_BTN.y, START_BTN.w, START_BTN.h, 'START');
+
+  // 칭호 목록(도감) 보기 버튼
+  ctx.fillStyle = 'rgba(0,0,0,0.45)';
+  ctx.strokeStyle = '#ffd23d';
+  ctx.lineWidth = 2;
+  ctx.fillRect(TITLES_BTN.x, TITLES_BTN.y, TITLES_BTN.w, TITLES_BTN.h);
+  ctx.strokeRect(TITLES_BTN.x, TITLES_BTN.y, TITLES_BTN.w, TITLES_BTN.h);
+  ctx.font = 'bold 13px monospace';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.lineWidth = 3;
+  ctx.strokeStyle = '#000000';
+  ctx.strokeText('★ 칭호 목록', TITLES_BTN.x + TITLES_BTN.w / 2, TITLES_BTN.y + TITLES_BTN.h / 2);
+  ctx.fillStyle = '#ffd23d';
+  ctx.fillText('★ 칭호 목록', TITLES_BTN.x + TITLES_BTN.w / 2, TITLES_BTN.y + TITLES_BTN.h / 2);
+}
+
+// 칭호 목록(조건 포함) 화면: 어떤 칭호가 있고 어떻게 얻는지, 이미 얻어본 칭호인지 보여줌
+function drawTitlesScreen() {
+  drawOutlinedText('칭호 목록', WIDTH / 2, 34, 22, '#ffd23d');
+
+  const panelX = 16;
+  const panelY = 54;
+  const panelW = WIDTH - 32;
+  const rowH = 58;
+  const panelH = TITLE_DEFS.length * rowH + 16;
+
+  ctx.fillStyle = 'rgba(0,0,0,0.5)';
+  ctx.fillRect(panelX, panelY, panelW, panelH);
+  ctx.strokeStyle = 'rgba(255,255,255,0.5)';
+  ctx.lineWidth = 1.5;
+  ctx.strokeRect(panelX, panelY, panelW, panelH);
+
+  TITLE_DEFS.forEach((def, i) => {
+    const rowY = panelY + 8 + i * rowH;
+    const unlocked = achievedTitles.has(def.text);
+
+    ctx.fillStyle = unlocked ? 'rgba(255,255,255,0.10)' : 'rgba(0,0,0,0.15)';
+    ctx.fillRect(panelX + 6, rowY, panelW - 12, rowH - 8);
+
+    const label = (unlocked ? '★ ' : '🔒 ') + def.text;
+    ctx.font = 'bold 13px monospace';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle';
+    ctx.lineWidth = 3;
+    ctx.strokeStyle = '#000000';
+    ctx.strokeText(label, panelX + 16, rowY + 17);
+    ctx.fillStyle = unlocked ? def.color : '#8a8a8a';
+    ctx.fillText(label, panelX + 16, rowY + 17);
+
+    ctx.font = '10px monospace';
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = '#000000';
+    ctx.strokeText(def.desc, panelX + 16, rowY + 38);
+    ctx.fillStyle = unlocked ? '#e8e8e8' : '#999999';
+    ctx.fillText(def.desc, panelX + 16, rowY + 38);
+  });
+
+  const hint = '화면을 탭하면 돌아갑니다';
+  ctx.font = 'bold 11px monospace';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.lineWidth = 3;
+  ctx.strokeStyle = '#000000';
+  ctx.strokeText(hint, WIDTH / 2, panelY + panelH + 20);
+  ctx.fillStyle = '#ffffff';
+  ctx.fillText(hint, WIDTH / 2, panelY + panelH + 20);
 }
 
 function drawReadyScreen() {
@@ -353,34 +1206,160 @@ function drawReadyScreen() {
 }
 
 function drawGameOverScreen() {
-  drawOutlinedText('Game Over', WIDTH / 2, 140, 26, '#fbd93a');
+  const title = gameOverReason === 'penalty' ? '면허정지!' : 'Game Over';
+  const titleColor = gameOverReason === 'penalty' ? '#ff5b5b' : '#fbd93a';
+  drawOutlinedText(title, WIDTH / 2, 46, 20, titleColor);
 
+  const subtitle = gameOverReason === 'penalty'
+    ? '신호위반 벌점이 초과되었습니다'
+    : '파이프에 충돌했습니다';
+  ctx.font = 'bold 10px monospace';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.lineWidth = 3;
+  ctx.strokeStyle = '#000000';
+  ctx.strokeText(subtitle, WIDTH / 2, 64);
+  ctx.fillStyle = '#ffffff';
+  ctx.fillText(subtitle, WIDTH / 2, 64);
+
+  // ---- 결과 요약 패널 (SCORE / 벌점 / 최고 콤보) ----
   const panelW = 220;
-  const panelH = 100;
   const panelX = WIDTH / 2 - panelW / 2;
-  const panelY = 190;
+  const statsY = 76;
+  const statsH = 88;
   ctx.fillStyle = '#ded895';
   ctx.strokeStyle = '#4a3b1e';
   ctx.lineWidth = 3;
-  ctx.fillRect(panelX, panelY, panelW, panelH);
-  ctx.strokeRect(panelX, panelY, panelW, panelH);
+  ctx.fillRect(panelX, statsY, panelW, statsH);
+  ctx.strokeRect(panelX, statsY, panelW, statsH);
 
-  ctx.font = 'bold 14px monospace';
+  ctx.font = 'bold 13px monospace';
   ctx.fillStyle = '#4a3b1e';
   ctx.textAlign = 'left';
   ctx.textBaseline = 'middle';
-  ctx.fillText('SCORE', panelX + 20, panelY + 35);
+  ctx.fillText('SCORE', panelX + 18, statsY + 22);
   ctx.textAlign = 'right';
-  ctx.fillText(String(score), panelX + panelW - 20, panelY + 35);
+  ctx.fillText(String(score), panelX + panelW - 18, statsY + 22);
 
-  drawButton(WIDTH / 2 - 70, panelY + panelH + 30, 140, 40, 'RESTART');
+  ctx.textAlign = 'left';
+  ctx.fillText('벌점', panelX + 18, statsY + 48);
+  ctx.textAlign = 'right';
+  ctx.fillStyle = penalty >= PENALTY_LIMIT ? '#c0392b' : '#4a3b1e';
+  ctx.fillText(`${penalty}/${PENALTY_LIMIT}`, panelX + panelW - 18, statsY + 48);
+
+  ctx.textAlign = 'left';
+  ctx.fillStyle = '#4a3b1e';
+  ctx.fillText('최고 콤보', panelX + 18, statsY + 74);
+  ctx.textAlign = 'right';
+  ctx.fillText(String(bestStreak), panelX + panelW - 18, statsY + 74);
+
+  // ---- 전체 칭호 목록 + 달성 여부 ----
+  const listY = statsY + statsH + 10;
+  const rowH = 24;
+  const listH = TITLE_DEFS.length * rowH + 14;
+  ctx.fillStyle = 'rgba(0,0,0,0.5)';
+  ctx.fillRect(panelX, listY, panelW, listH);
+  ctx.strokeStyle = 'rgba(255,255,255,0.5)';
+  ctx.lineWidth = 1.5;
+  ctx.strokeRect(panelX, listY, panelW, listH);
+
+  TITLE_DEFS.forEach((def, i) => {
+    const rowY = listY + 10 + i * rowH;
+    const unlocked = achievedTitles.has(def.text);
+    const isNew = currentTitle === def.text;
+    const mark = unlocked ? '✓' : '✗';
+
+    ctx.font = 'bold 10px monospace';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle';
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = '#000000';
+    const label = `${mark} ${def.text}`;
+    ctx.strokeText(label, panelX + 14, rowY);
+    ctx.fillStyle = unlocked ? def.color : '#777777';
+    ctx.fillText(label, panelX + 14, rowY);
+
+    if (isNew) {
+      ctx.font = 'bold 9px monospace';
+      ctx.textAlign = 'right';
+      ctx.strokeText('NEW', panelX + panelW - 14, rowY);
+      ctx.fillStyle = '#ffd23d';
+      ctx.fillText('NEW', panelX + panelW - 14, rowY);
+    }
+  });
+
+  const btnY = listY + listH + 14;
+  drawButton(WIDTH / 2 - 70, btnY, 140, 36, 'RESTART');
+}
+
+function drawMoveButtons() {
+  // 왼쪽: 유턴(뒤로 물러나 대기)
+  ctx.fillStyle = moveLeftHeld ? 'rgba(61,220,87,0.55)' : 'rgba(0,0,0,0.4)';
+  ctx.strokeStyle = '#ffffff';
+  ctx.lineWidth = 2;
+  ctx.fillRect(LEFT_BTN.x, LEFT_BTN.y, LEFT_BTN.w, LEFT_BTN.h);
+  ctx.strokeRect(LEFT_BTN.x, LEFT_BTN.y, LEFT_BTN.w, LEFT_BTN.h);
+  ctx.font = 'bold 11px monospace';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillStyle = '#ffffff';
+  ctx.fillText('◀ 유턴', LEFT_BTN.x + LEFT_BTN.w / 2, LEFT_BTN.y + LEFT_BTN.h / 2);
+
+  // 오른쪽: 전진
+  ctx.fillStyle = moveRightHeld ? 'rgba(61,220,87,0.55)' : 'rgba(0,0,0,0.4)';
+  ctx.fillRect(RIGHT_BTN.x, RIGHT_BTN.y, RIGHT_BTN.w, RIGHT_BTN.h);
+  ctx.strokeRect(RIGHT_BTN.x, RIGHT_BTN.y, RIGHT_BTN.w, RIGHT_BTN.h);
+  ctx.fillStyle = '#ffffff';
+  ctx.fillText('전진 ▶', RIGHT_BTN.x + RIGHT_BTN.w / 2, RIGHT_BTN.y + RIGHT_BTN.h / 2);
+}
+
+function drawPauseButton() {
+  const { x, y, w, h } = PAUSE_BTN;
+  ctx.fillStyle = 'rgba(0,0,0,0.45)';
+  ctx.strokeStyle = '#ffffff';
+  ctx.lineWidth = 2;
+  ctx.fillRect(x, y, w, h);
+  ctx.strokeRect(x, y, w, h);
+
+  ctx.fillStyle = '#ffffff';
+  if (paused) {
+    // 재생(▶) 아이콘
+    ctx.beginPath();
+    ctx.moveTo(x + w * 0.35, y + h * 0.22);
+    ctx.lineTo(x + w * 0.35, y + h * 0.78);
+    ctx.lineTo(x + w * 0.8, y + h * 0.5);
+    ctx.closePath();
+    ctx.fill();
+  } else {
+    // 일시정지(||) 아이콘
+    ctx.fillRect(x + w * 0.28, y + h * 0.22, w * 0.16, h * 0.56);
+    ctx.fillRect(x + w * 0.56, y + h * 0.22, w * 0.16, h * 0.56);
+  }
+}
+
+function drawPauseOverlay() {
+  ctx.fillStyle = 'rgba(0,0,0,0.5)';
+  ctx.fillRect(0, 0, WIDTH, HEIGHT);
+  drawOutlinedText('일시정지', WIDTH / 2, HEIGHT / 2 - 20, 26, '#ffffff');
+
+  ctx.font = 'bold 12px monospace';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.lineWidth = 3;
+  ctx.strokeStyle = '#000000';
+  const hint = '화면을 탭하거나 P를 눌러 재개';
+  ctx.strokeText(hint, WIDTH / 2, HEIGHT / 2 + 16);
+  ctx.fillStyle = '#dddddd';
+  ctx.fillText(hint, WIDTH / 2, HEIGHT / 2 + 16);
 }
 
 function render() {
   drawBackground();
   drawPipes();
+  drawUturnSigns();
   drawGround();
   drawBird();
+  drawPopups();
 
   if (state === STATE.START) {
     drawStartScreen();
@@ -388,15 +1367,33 @@ function render() {
     drawReadyScreen();
   } else if (state === STATE.PLAY) {
     drawScore();
+    drawTitleBadge();
+    drawPenaltyHUD();
+    drawPauseButton();
+    drawMoveButtons();
+    if (uturnBannerTimer > 0) {
+      drawUturnBanner();
+    }
+    if (paused) {
+      drawPauseOverlay();
+    }
   } else if (state === STATE.GAMEOVER) {
     drawGameOverScreen();
+  } else if (state === STATE.TITLES) {
+    drawTitlesScreen();
   }
+
+  drawFlashOverlay();
 }
 
 function update() {
+  if (state === STATE.PLAY && paused) {
+    return; // 일시정지 중에는 아무것도 갱신하지 않음
+  }
+
   updateWingAnimation();
 
-  if (state === STATE.START) {
+  if (state === STATE.START || state === STATE.TITLES) {
     idleTimer++;
     bird.y = 190 + Math.sin(idleTimer / 15) * 8;
   } else if (state === STATE.READY) {
@@ -410,6 +1407,7 @@ function update() {
 }
 
 function loop() {
+  bgCycleFrame++;
   update();
   render();
   requestAnimationFrame(loop);
